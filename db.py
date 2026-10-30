@@ -61,7 +61,17 @@ USER_COLUMNS = {
     "last_seen": "TEXT",
     "promo_campaign": "TEXT",  # id останньої акції, якою скористався користувач
     "tg_lang": "TEXT",  # мова Telegram користувача (для локалізованих анонсів)
+    "source": "TEXT",  # звідки прийшов користувач (тег із посилання ?start=src_ТЕГ)
 }
+
+
+# Адміни мають вічний безліміт. /asuser тимчасово вимикає його (до перезапуску) — щоб протестувати
+# бота "очима звичайного користувача".
+LIFETIME_OFF: set[int] = set()
+
+
+def is_lifetime(user_id: int) -> bool:
+    return user_id in config.ADMIN_IDS and user_id not in LIFETIME_OFF
 
 
 def _now_utc() -> dt.datetime:
@@ -97,8 +107,12 @@ class Access:
     tg_lang: str | None
 
     @property
+    def is_lifetime(self) -> bool:
+        return is_lifetime(self.user_id)
+
+    @property
     def is_premium(self) -> bool:
-        return bool(self.premium_until and self.premium_until > _now_utc())
+        return self.is_lifetime or bool(self.premium_until and self.premium_until > _now_utc())
 
     @property
     def daily_left(self) -> int:
@@ -217,7 +231,7 @@ async def register_download(
         await _ensure_user(db, user_id)
         cur = await db.execute("SELECT premium_until FROM users WHERE user_id = ?", (user_id,))
         (pu,) = await cur.fetchone()
-        premium = bool(pu and dt.datetime.fromisoformat(pu) > _now_utc())
+        premium = is_lifetime(user_id) or bool(pu and dt.datetime.fromisoformat(pu) > _now_utc())
         if not premium:
             cur = await db.execute(
                 "UPDATE users SET free_used = free_used + 1 WHERE user_id = ? AND free_used < ?",
@@ -238,7 +252,9 @@ async def register_download(
 # --------------------------------------------------------------------------- #
 #  Рефералка та "поділитись"
 # --------------------------------------------------------------------------- #
-async def register_start(user_id: int, ref_id: int | None) -> tuple[bool, bool]:
+async def register_start(
+    user_id: int, ref_id: int | None, source: str | None = None
+) -> tuple[bool, bool]:
     """
     Викликається на /start. Повертає (новий_користувач, реферальний_бонус_нараховано).
     Бонус отримують обоє, але лише якщо користувач прийшов ВПЕРШЕ і реферер існує.
@@ -246,6 +262,8 @@ async def register_start(user_id: int, ref_id: int | None) -> tuple[bool, bool]:
     applied = False
     async with aiosqlite.connect(config.DB_PATH) as db:
         created = await _ensure_user(db, user_id)
+        if created and source:  # джерело фіксуємо лише при першому запуску
+            await db.execute("UPDATE users SET source = ? WHERE user_id = ?", (source, user_id))
         if created and ref_id and ref_id != user_id:
             cur = await db.execute("SELECT ref_count FROM users WHERE user_id = ?", (ref_id,))
             row = await cur.fetchone()
@@ -486,6 +504,34 @@ async def promo_sales(promo: Promo) -> tuple[int, int]:
 # --------------------------------------------------------------------------- #
 #  Статистика та розсилка (для адміна)
 # --------------------------------------------------------------------------- #
+async def all_recipients() -> list[tuple[int, str | None, str | None]]:
+    """Усі користувачі для розсилки: (user_id, збережена мова, мова Telegram)."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, lang, tg_lang FROM users")
+        return [tuple(row) for row in await cur.fetchall()]
+
+
+async def get_sources() -> list[tuple[str, int, int]]:
+    """Топ джерел: (тег, користувачів, з них платних). Без тегу — '—' (органіка/невідомо)."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(u.source, '—') AS src, COUNT(DISTINCT u.user_id), COUNT(DISTINCT p.user_id) "
+            "FROM users u LEFT JOIN payments p ON p.user_id = u.user_id AND p.plan != 'donate' "
+            "GROUP BY src ORDER BY 2 DESC LIMIT 10"
+        )
+        return [tuple(row) for row in await cur.fetchall()]
+
+
+async def get_growth(days: int = 7) -> list[tuple[str, int]]:
+    """Нові користувачі по днях (дата за UTC): [(дата, кількість)], найновіші першими."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT substr(created_at, 1, 10) AS d, COUNT(*) FROM users GROUP BY d ORDER BY d DESC LIMIT ?",
+            (days,),
+        )
+        return [tuple(row) for row in await cur.fetchall()]
+
+
 async def all_user_ids() -> list[int]:
     async with aiosqlite.connect(config.DB_PATH) as db:
         cur = await db.execute("SELECT user_id FROM users")

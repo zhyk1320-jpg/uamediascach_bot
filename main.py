@@ -34,6 +34,8 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
     CallbackQuery,
     ChosenInlineResult,
     FSInputFile,
@@ -57,8 +59,11 @@ from downloader import MediaError, Options, Progress
 from texts import LANGS, pick_lang, tr
 
 log = logging.getLogger("bot")
-router = Router()
+router = Router()  # особисті чати: усі функції, меню, платежі та АДМІНКА
 router.message.filter(F.chat.type == "private")
+# Групи: лише завантаження (/dl та посилання). Жодних адмінських команд тут немає.
+group_router = Router()
+group_router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 
 BOT_USERNAME = ""
 
@@ -78,13 +83,13 @@ DONATE_PRESETS = (25, 50, 100, 250)
 #  Стан у пам'яті
 # --------------------------------------------------------------------------- #
 PENDING: "OrderedDict[str, tuple[int, object]]" = OrderedDict()  # токен -> (user_id, дані)
-AWAIT: dict[int, tuple[str, float, dict]] = {}  # очікуємо від користувача: суму донату або тайм-коди
+AWAIT: dict[int, tuple[str, float, dict]] = {}  # очікуємо від людини: суму донату, тайм-коди, тексти адміна
 ACTIVE: set[int] = set()  # користувачі, у яких зараз іде завантаження
 LAST_SEARCH: dict[int, float] = {}
-BROADCAST: dict[int, str] = {}
+BROADCAST: dict[int, dict] = {}
 SEM = asyncio.Semaphore(config.MAX_PARALLEL)
 URL_RE = re.compile(r"https?://\S+")
-AWAIT_TTL = 300  # секунд
+AWAIT_TTL = 600  # секунд
 
 
 @dataclass
@@ -169,6 +174,11 @@ def main_menu(lang: str) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def menu_for(chat_id: int, lang: str) -> InlineKeyboardMarkup | None:
+    """Головне меню — лише в особистих чатах (у групах ідентифікатор чату від'ємний)."""
+    return main_menu(lang) if chat_id > 0 else None
+
+
 def back_kb(lang: str, target: str = "menu:main") -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(lang, "b_back"), callback_data=target)
@@ -232,10 +242,15 @@ def lang_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def format_kb(lang: str, token: str) -> InlineKeyboardMarkup:
+def format_kb(lang: str, token: str, group: bool = False) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🎬 360p", callback_data=f"dl:{token}:v360")
     kb.button(text="🎬 720p", callback_data=f"dl:{token}:v720")
+    if group:  # у групах — лише базові варіанти (1080p, обрізка й GIF — в особистому чаті)
+        kb.button(text=tr(lang, "b_audio"), callback_data=f"dl:{token}:mp3")
+        kb.button(text=tr(lang, "b_cancel"), callback_data=f"dl:{token}:x")
+        kb.adjust(2, 1, 1)
+        return kb.as_markup()
     kb.button(text="🎬 1080p 💎", callback_data=f"dl:{token}:v1080")
     kb.button(text=tr(lang, "b_audio"), callback_data=f"dl:{token}:mp3")
     kb.button(text=tr(lang, "b_cut"), callback_data=f"dl:{token}:cut")
@@ -263,9 +278,13 @@ def promo_banner(lang: str, promo: "db.Promo") -> str:
     return tr(lang, "promo_banner", offer=offer, until=db.fmt_dt(promo.until))
 
 
+def until_text(lang: str, access: db.Access) -> str:
+    return tr(lang, "lifetime") if access.is_lifetime else db.fmt_dt(access.premium_until)
+
+
 def profile_text(lang: str, access: db.Access, name: str) -> str:
     if access.is_premium:
-        return tr(lang, "profile_prem", name=esc(name), until=db.fmt_dt(access.premium_until))
+        return tr(lang, "profile_prem", name=esc(name), until=until_text(lang, access))
     return tr(
         lang, "profile_free",
         name=esc(name), daily=access.daily_left, limit=config.FREE_LIMIT, bonus=access.bonus,
@@ -292,7 +311,7 @@ def paywall_text(lang: str, access: db.Access, promo=None) -> str:
 
 def done_text(lang: str, access: db.Access) -> str:
     if access.is_premium:
-        tail = tr(lang, "tail_prem", until=db.fmt_dt(access.premium_until))
+        tail = tr(lang, "tail_prem", until=until_text(lang, access))
     else:
         tail = tr(lang, "tail_free", daily=access.daily_left, limit=config.FREE_LIMIT)
         if access.bonus:
@@ -301,6 +320,11 @@ def done_text(lang: str, access: db.Access) -> str:
 
 
 async def send_paywall(bot: Bot, chat_id: int, lang: str, access: db.Access, status=None) -> None:
+    if chat_id < 0:  # у групі не показуємо платіжні кнопки — відправляємо людину в особистий чат
+        kb = InlineKeyboardBuilder()
+        kb.button(text=tr(lang, "b_open_private"), url=f"https://t.me/{BOT_USERNAME}?start=premium")
+        await edit_or_send(bot, chat_id, status, tr(lang, "group_paywall"), kb.as_markup())
+        return
     promo = await db.promo_offer(access)
     await edit_or_send(
         bot, chat_id, status, paywall_text(lang, access, promo), paywall_kb(lang, access, promo)
@@ -431,7 +455,7 @@ async def run_job(
     status: Message | None = None, tracks: list | None = None,
 ) -> None:
     if user_id in ACTIVE:
-        await edit_or_send(bot, chat_id, status, tr(lang, "busy"), main_menu(lang))
+        await edit_or_send(bot, chat_id, status, tr(lang, "busy"), menu_for(chat_id, lang))
         return
     ACTIVE.add(user_id)
     try:
@@ -446,7 +470,7 @@ async def run_job(
             access = await deliver(bot, chat_id, user_id, lang, job, status)
             with contextlib.suppress(Exception):
                 await status.delete()
-            await bot.send_message(chat_id, done_text(lang, access), reply_markup=main_menu(lang))
+            await bot.send_message(chat_id, done_text(lang, access), reply_markup=menu_for(chat_id, lang))
             return
 
         # --- альбом / плейлист Spotify (лише преміум) ---
@@ -464,14 +488,14 @@ async def run_job(
         with contextlib.suppress(Exception):
             await status.delete()
         await bot.send_message(
-            chat_id, tr(lang, "col_done", ok=sent, n=len(tracks)), reply_markup=main_menu(lang)
+            chat_id, tr(lang, "col_done", ok=sent, n=len(tracks)), reply_markup=menu_for(chat_id, lang)
         )
 
     except MediaError as exc:
-        await edit_or_send(bot, chat_id, status, err_text(lang, exc), main_menu(lang))
+        await edit_or_send(bot, chat_id, status, err_text(lang, exc), menu_for(chat_id, lang))
     except Exception:
         log.exception("Непередбачена помилка під час завантаження")
-        await edit_or_send(bot, chat_id, status, tr(lang, "unexpected"), main_menu(lang))
+        await edit_or_send(bot, chat_id, status, tr(lang, "unexpected"), menu_for(chat_id, lang))
     finally:
         ACTIVE.discard(user_id)
 
@@ -483,12 +507,18 @@ async def run_job(
 async def cmd_start(m: Message, command: CommandObject, bot: Bot) -> None:
     uid = m.from_user.id
     AWAIT.pop(uid, None)
-    ref_match = re.fullmatch(r"ref_(\d+)", command.args or "")
+    args = command.args or ""
+    ref_match = re.fullmatch(r"ref_(\d+)", args)
+    src_match = re.fullmatch(r"src_([A-Za-z0-9_-]{1,32})", args)
     ref_id = int(ref_match.group(1)) if ref_match else None
-    _, applied = await db.register_start(uid, ref_id)
+    source = src_match.group(1) if src_match else None
+    _, applied = await db.register_start(uid, ref_id, source)
     access, lang = await get_ctx(m.from_user)
 
     promo = await db.promo_offer(access)
+    if args == "premium":  # людина прийшла з групи по кнопці "Відкрити бота"
+        await m.answer(premium_text(lang, promo), reply_markup=premium_kb(lang, promo))
+        return
     text = tr(lang, "welcome", name=esc(m.from_user.full_name), limit=config.FREE_LIMIT)
     if promo:
         text = promo_banner(lang, promo) + "\n\n" + text
@@ -808,7 +838,10 @@ def parse_cut(text: str) -> tuple[float, float, str] | None:
 
 
 # --------------------------------------------------------------------------- #
-#  Адмінка: акції в 1 клік, анонс, статистика, розсилка (лише для ID з ADMIN_IDS)
+#  Адмінка: оголошення, акції в 1 клік, статистика, джерела (лише для ID з ADMIN_IDS)
+#  БЕЗПЕКА: усі адмінські команди живуть тільки в router (особисті чати), а кнопки
+#  панелі додатково перевіряють, що натискання відбулось в особистому чаті з ботом.
+#  У групах (group_router) адмінських команд не існує — навіть для власника.
 # --------------------------------------------------------------------------- #
 ADMIN = F.from_user.id.in_(config.ADMIN_IDS)
 
@@ -829,6 +862,23 @@ AUDIENCE_NAMES = {
     "free": "усі без активного преміуму",
 }
 AUDIENCE_SHORT = {"new": "нові", "all": "усі", "free": "без преміуму"}
+BC_STEPS = ("uk", "ru", "en")
+BC_LABELS = {"uk": "українською 🇺🇦", "ru": "російською 🇷🇺", "en": "англійською 🇬🇧"}
+PROMO_FORMAT_HELP = (
+    "Формат: <code>ДНІ ЦІНА АУДИТОРІЯ ГОДИНИ</code>\n"
+    "Приклад: <code>1 1 all 24</code> — день безліміту за 1 ⭐ для всіх, акція триває 24 год.\n"
+    "Аудиторія: <b>new</b> (нові), <b>all</b> (усі), <b>free</b> (без активного преміуму).\n"
+    "Дні 1–365, ціна 1–5000 ⭐, тривалість акції 1–720 год."
+)
+
+
+def is_admin_cb(cb: CallbackQuery) -> bool:
+    """Натискання кнопки адмінки дійсне лише від адміна І лише в особистому чаті з ботом."""
+    return (
+        cb.from_user.id in config.ADMIN_IDS
+        and cb.message is not None
+        and cb.message.chat.type == "private"
+    )
 
 
 def preset_label(days: int, price: int, audience: str, hours: int) -> str:
@@ -836,22 +886,45 @@ def preset_label(days: int, price: int, audience: str, hours: int) -> str:
     return f"🔥 {days} дн. за {price} ⭐ · {AUDIENCE_SHORT[audience]} · {duration}"
 
 
-def admin_kb(promo: "db.Promo | None") -> InlineKeyboardMarkup:
+def parse_promo_args(text: str) -> tuple[int, int, str, int] | None:
+    parts = text.split()
+    try:
+        days, price, audience, hours = int(parts[0]), int(parts[1]), parts[2].lower(), int(parts[3])
+    except (IndexError, ValueError):
+        return None
+    if 1 <= days <= 365 and 1 <= price <= 5000 and 1 <= hours <= 720 and audience in db.AUDIENCES:
+        return days, price, audience, hours
+    return None
+
+
+def admin_kb(promo: "db.Promo | None", ann_count: int = 0) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    kb.button(text="📢 Оголошення всім", callback_data="adm:bc")
     for code, days, price, audience, hours in PROMO_PRESETS:
         kb.button(text=preset_label(days, price, audience, hours), callback_data=f"adm:promo:{code}")
+    kb.button(text="➕ Створити свою акцію", callback_data="adm:newpromo")
     if promo:
-        kb.button(text="📣 Анонсувати акцію тим, кому вона доступна", callback_data="adm:ann")
+        kb.button(text=f"📣 Анонсувати акцію ({ann_count} отримувачів)", callback_data="adm:ann")
         kb.button(text="⏹ Зупинити акцію", callback_data="adm:stop")
     kb.button(text="📊 Статистика", callback_data="adm:stats")
+    kb.button(text="🔗 Посилання для реклами", callback_data="adm:links")
     kb.adjust(1)
     return kb.as_markup()
 
 
-async def admin_panel_text() -> str:
+def admin_back_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Панель адміна", callback_data="adm:home")
+    return kb.as_markup()
+
+
+async def admin_view(prefix: str = "") -> tuple[str, InlineKeyboardMarkup]:
+    """Текст і кнопки головного екрана адмін-панелі."""
     promo = await db.promo_window()
+    ann_count = 0
     if promo:
         sold, stars = await db.promo_sales(promo)
+        ann_count = len(await db.promo_recipients(promo))
         announced = "надіслано" if await db.promo_is_announced(promo.id) else "ще не надсилався"
         status = (
             f"🔥 <b>Активна акція:</b> безліміт на {promo.days} дн. за {promo.price} ⭐\n"
@@ -862,17 +935,22 @@ async def admin_panel_text() -> str:
         )
     else:
         status = "Активної акції немає."
-    return (
-        "🛠 <b>Панель адміна</b>\n\n"
-        f"{status}\n\n"
-        "Обери готову акцію — вона стартує одразу. Нова акція замінює поточну.\n"
-        "Своя акція: <code>/promo 1 1 all 24</code>\n"
-        "(днів безліміту · ціна ⭐ · new/all/free · тривалість акції в годинах)"
+    text = (
+        f"{prefix}🛠 <b>Панель адміна</b>\n\n{status}\n\n"
+        "📢 <b>Оголошення</b> — напишеш текст, і його отримають усі (кожен своєю мовою).\n"
+        "🔥 <b>Акція</b> — обери готову (стартує одразу) або створи свою, потім анонсуй."
     )
+    return text, admin_kb(promo, ann_count)
 
 
 async def stats_text() -> str:
     s = await db.get_stats()
+    growth = await db.get_growth(7)
+    sources = await db.get_sources()
+    growth_lines = "\n".join(f"{d} — {n}" for d, n in growth) or "—"
+    source_lines = "\n".join(
+        f"{esc(src) if src != '—' else '— (без тегу)'} — {users} / {buyers}" for src, users, buyers in sources
+    ) or "—"
     return (
         "📊 <b>Статистика</b>\n\n"
         f"👥 Користувачів: <b>{s['users']}</b> (нових сьогодні: {s['new_today']}, активних сьогодні: {s['active_today']})\n"
@@ -881,7 +959,23 @@ async def stats_text() -> str:
         f"📥 Завантажень: сьогодні <b>{s['dl_today']}</b>, усього <b>{s['dl_total']}</b> "
         f"(миттєво з кешу: {s['dl_cached']}, файлів у кеші: {s['cache_items']})\n"
         f"⭐ Платежів: <b>{s['payments']}</b>, зірок усього: <b>{s['stars_total']}</b> "
-        f"(донати: {s['stars_donate']}, акційні покупки: {s['promo_sales']} на {s['promo_stars']} ⭐)"
+        f"(донати: {s['stars_donate']}, акційні покупки: {s['promo_sales']} на {s['promo_stars']} ⭐)\n\n"
+        f"📈 <b>Нові користувачі за 7 днів (UTC):</b>\n{growth_lines}\n\n"
+        f"🔗 <b>Джерела</b> (тег — користувачів / платних):\n{source_lines}"
+    )
+
+
+def links_text() -> str:
+    return (
+        "🔗 <b>Посилання для реклами</b>\n\n"
+        "Додай до посилання на бота тег джерела — і в статистиці побачиш, звідки приходять люди "
+        "і скільки з них платить:\n"
+        f"<code>https://t.me/{BOT_USERNAME}?start=src_tiktok1</code>\n\n"
+        "Замість <code>tiktok1</code> — будь-який тег (латиниця, цифри, _ або -, до 32 символів), "
+        "наприклад <code>src_yt_shorts</code> чи <code>src_chat_ua</code>. "
+        "Роби окремий тег для кожного відео, каналу чи реклами. "
+        "Тег запам'ятовується, коли людина вперше запускає бота.\n\n"
+        "Швидко згенерувати посилання: <code>/link тег</code>"
     )
 
 
@@ -898,6 +992,7 @@ async def _send_safely(bot: Bot, uid: int, text: str, kb: InlineKeyboardMarkup |
     return False
 
 
+# ---------------------------- анонс акції ---------------------------- #
 async def _announce(bot: Bot, admin_chat: int, promo: "db.Promo") -> None:
     """Анонс акції: кожен отримує текст СВОЄЮ мовою та кнопку, що одразу відкриває оплату."""
     ok = fail = 0
@@ -914,9 +1009,115 @@ async def _announce(bot: Bot, admin_chat: int, promo: "db.Promo") -> None:
     await bot.send_message(admin_chat, f"📣 Анонс акції завершено: доставлено {ok}, не вдалося {fail}.")
 
 
+async def promo_custom_receive(m: Message, text: str) -> None:
+    parsed = parse_promo_args(text)
+    if not parsed:
+        AWAIT[m.from_user.id] = ("promo_custom", time.time(), {})
+        await m.answer("🤔 Не вдалося розібрати.\n\n" + PROMO_FORMAT_HELP)
+        return
+    promo = await db.start_promo(*parsed)
+    view, kb = await admin_view("✅ Акцію створено й запущено!\n\n")
+    await m.answer(view, reply_markup=kb)
+
+
+# ---------------------------- оголошення всім ---------------------------- #
+def bc_prompt(step: str) -> str:
+    if step == "uk":
+        return (
+            "📢 <b>Оголошення всім</b>\n\n"
+            "Надішли текст <b>українською 🇺🇦</b>. Можна використовувати форматування Telegram "
+            "(жирний, курсив, посилання) — воно збережеться. Його отримають усі користувачі "
+            "з українською мовою, а також ті, для кого не буде перекладу.\n\n"
+            "Далі я попрошу переклади — їх можна пропустити."
+        )
+    return (
+        f"Тепер текст <b>{BC_LABELS[step]}</b> — для користувачів із цією мовою інтерфейсу.\n"
+        "Або натисни «Пропустити» — тоді вони отримають український варіант."
+    )
+
+
+def bc_kb(step: str) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    if step != "uk":
+        kb.button(text="⏭ Пропустити", callback_data="adm:bcskip")
+    kb.button(text="✖️ Скасувати", callback_data="adm:home")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def bc_advance(bot: Bot, chat_id: int, admin_id: int, state: dict) -> None:
+    """Наступний крок майстра: просимо переклад або показуємо перегляд."""
+    idx = BC_STEPS.index(state["step"]) + 1
+    if idx < len(BC_STEPS):
+        state["step"] = BC_STEPS[idx]
+        AWAIT[admin_id] = ("bc", time.time(), state)
+        await bot.send_message(chat_id, bc_prompt(state["step"]), reply_markup=bc_kb(state["step"]))
+    else:
+        AWAIT.pop(admin_id, None)
+        await bc_preview(bot, chat_id, admin_id, state["texts"])
+
+
+async def bc_receive(m: Message, bot: Bot, state: dict) -> None:
+    # html_text зберігає форматування, яке адмін зробив у Telegram (жирний, посилання тощо)
+    state["texts"][state["step"]] = getattr(m, "html_text", None) or m.text
+    await bc_advance(bot, m.chat.id, m.from_user.id, state)
+
+
+async def bc_preview(bot: Bot, chat_id: int, admin_id: int, texts: dict) -> None:
+    """Показує, як виглядатиме оголошення кожною мовою, і просить підтвердити відправку."""
+    for lang in BC_STEPS:
+        if texts.get(lang):
+            try:
+                await bot.send_message(chat_id, f"👁 <b>{lang.upper()}</b>\n\n{texts[lang]}")
+            except TelegramBadRequest:
+                await bot.send_message(
+                    chat_id,
+                    "⚠️ У тексті помилка розмітки — Telegram не зміг його показати. "
+                    "Спробуй ще раз: /admin → «Оголошення всім».",
+                )
+                return
+    recipients = await db.all_recipients()
+    counts = {"uk": 0, "ru": 0, "en": 0}
+    for _, saved, tg in recipients:
+        counts[pick_lang(saved, tg)] += 1
+    fallback = [BC_LABELS[l] for l in BC_STEPS if not texts.get(l)]
+    note = f"\nБез власного тексту (отримають український): {', '.join(fallback)}." if fallback else ""
+    BROADCAST[admin_id] = dict(texts)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🚀 Надіслати всім", callback_data="adm:bcsend")
+    kb.button(text="✖️ Скасувати", callback_data="adm:home")
+    kb.adjust(1)
+    await bot.send_message(
+        chat_id,
+        f"📢 Отримувачів: <b>{len(recipients)}</b> (🇺🇦 {counts['uk']} · 🇷🇺 {counts['ru']} · 🇬🇧 {counts['en']}).{note}\n\n"
+        "Усе правильно? Після натискання скасувати вже не вийде.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+async def _broadcast(bot: Bot, admin_chat: int, texts: dict) -> None:
+    ok = fail = 0
+    per = {"uk": 0, "ru": 0, "en": 0}
+    for uid, saved_lang, tg_lang in await db.all_recipients():
+        lang = pick_lang(saved_lang, tg_lang)
+        if await _send_safely(bot, uid, texts.get(lang) or texts["uk"]):
+            ok += 1
+            per[lang] += 1
+        else:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await bot.send_message(
+        admin_chat,
+        f"📢 Оголошення розіслано: доставлено {ok} (🇺🇦 {per['uk']} · 🇷🇺 {per['ru']} · 🇬🇧 {per['en']}), "
+        f"не вдалося {fail} (наприклад, люди заблокували бота).",
+    )
+
+
+# ---------------------------- команди адміна ---------------------------- #
 @router.message(Command("admin"), ADMIN)
 async def cmd_admin(m: Message) -> None:
-    await m.answer(await admin_panel_text(), reply_markup=admin_kb(await db.promo_window()))
+    text, kb = await admin_view()
+    await m.answer(text, reply_markup=kb)
 
 
 @router.message(Command("stats"), ADMIN)
@@ -924,31 +1125,26 @@ async def cmd_stats(m: Message) -> None:
     await m.answer(await stats_text())
 
 
+@router.message(Command("broadcast"), ADMIN)
+async def cmd_broadcast(m: Message) -> None:
+    AWAIT[m.from_user.id] = ("bc", time.time(), {"step": "uk", "texts": {}})
+    await m.answer(bc_prompt("uk"), reply_markup=bc_kb("uk"))
+
+
 @router.message(Command("promo"), ADMIN)
 async def cmd_promo(m: Message, command: CommandObject) -> None:
     """/promo — панель; /promo ДНІ ЦІНА АУДИТОРІЯ ГОДИНИ — своя акція (напр. /promo 1 1 all 24)."""
     if not command.args:
-        await m.answer(await admin_panel_text(), reply_markup=admin_kb(await db.promo_window()))
+        text, kb = await admin_view()
+        await m.answer(text, reply_markup=kb)
         return
-    parts = command.args.split()
-    try:
-        days, price, audience, hours = int(parts[0]), int(parts[1]), parts[2].lower(), int(parts[3])
-    except (IndexError, ValueError):
-        days = price = hours = 0
-        audience = ""
-    if not (1 <= days <= 365 and 1 <= price <= 5000 and 1 <= hours <= 720 and audience in db.AUDIENCES):
-        await m.answer(
-            "Формат: <code>/promo ДНІ ЦІНА АУДИТОРІЯ ГОДИНИ</code>\n"
-            "Приклад: <code>/promo 1 1 all 24</code> — день безліміту за 1 ⭐ для всіх, акція триває 24 год.\n"
-            "Аудиторія: <b>new</b> (нові), <b>all</b> (усі), <b>free</b> (без активного преміуму).\n"
-            "Дні 1–365, ціна 1–5000 ⭐, тривалість 1–720 год."
-        )
+    parsed = parse_promo_args(command.args)
+    if not parsed:
+        await m.answer(PROMO_FORMAT_HELP)
         return
-    promo = await db.start_promo(days, price, audience, hours)
-    await m.answer(
-        "✅ Акцію запущено! Тепер її бачать у меню ті, кому вона доступна.\n\n" + await admin_panel_text(),
-        reply_markup=admin_kb(promo),
-    )
+    await db.start_promo(*parsed)
+    text, kb = await admin_view("✅ Акцію запущено!\n\n")
+    await m.answer(text, reply_markup=kb)
 
 
 @router.message(Command("promo_off"), ADMIN)
@@ -957,13 +1153,39 @@ async def cmd_promo_off(m: Message) -> None:
     await m.answer("Акцію вимкнено.")
 
 
+@router.message(Command("link"), ADMIN)
+async def cmd_link(m: Message, command: CommandObject) -> None:
+    tag = (command.args or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", tag):
+        await m.answer(links_text())
+        return
+    await m.answer(f"🔗 Посилання з тегом <b>{esc(tag)}</b>:\n<code>https://t.me/{BOT_USERNAME}?start=src_{tag}</code>")
+
+
+@router.message(Command("asuser"), ADMIN)
+async def cmd_asuser(m: Message) -> None:
+    """Перемикає вічний безліміт адміна, щоб тестувати ліміти й акції як звичайний користувач."""
+    uid = m.from_user.id
+    if uid in db.LIFETIME_OFF:
+        db.LIFETIME_OFF.discard(uid)
+        await m.answer("♾ Вічний безліміт знову увімкнено.")
+    else:
+        db.LIFETIME_OFF.add(uid)
+        await m.answer(
+            "👤 Тепер ти для бота — звичайний користувач (діє до перезапуску або повторної /asuser). "
+            "Так можна перевірити ліміти, paywall та акції."
+        )
+
+
 @router.callback_query(F.data.startswith("adm:"))
 async def on_admin(cb: CallbackQuery, bot: Bot) -> None:
-    if cb.from_user.id not in config.ADMIN_IDS:
+    if not is_admin_cb(cb):  # не адмін АБО натиснуто не в особистому чаті — мовчки ігноруємо
         await cb.answer()
         return
     parts = cb.data.split(":")
     action = parts[1]
+    admin_id = cb.from_user.id
+    chat_id = cb.message.chat.id
 
     if action == "promo" and len(parts) == 3:
         preset = next((p for p in PROMO_PRESETS if p[0] == parts[2]), None)
@@ -971,17 +1193,22 @@ async def on_admin(cb: CallbackQuery, bot: Bot) -> None:
             await cb.answer("Невідомий пресет", show_alert=True)
             return
         _, days, price, audience, hours = preset
-        promo = await db.start_promo(days, price, audience, hours)
+        await db.start_promo(days, price, audience, hours)
         await cb.answer("🔥 Акцію запущено!")
+        text, kb = await admin_view("✅ Акцію запущено! Не забудь анонсувати її кнопкою нижче.\n\n")
+        await show(cb.message, text, kb)
+    elif action == "newpromo":
+        AWAIT[admin_id] = ("promo_custom", time.time(), {})
+        await cb.answer()
         await show(
-            cb.message,
-            "✅ Акцію запущено! Не забудь анонсувати її кнопкою нижче.\n\n" + await admin_panel_text(),
-            admin_kb(promo),
+            cb.message, "➕ <b>Своя акція</b>\n\nНадішли параметри одним повідомленням.\n\n" + PROMO_FORMAT_HELP,
+            admin_back_kb(),
         )
     elif action == "stop":
         await db.stop_promo()
         await cb.answer("Акцію вимкнено")
-        await show(cb.message, await admin_panel_text(), admin_kb(None))
+        text, kb = await admin_view()
+        await show(cb.message, text, kb)
     elif action == "ann":
         promo = await db.promo_window()
         if not promo:
@@ -993,54 +1220,39 @@ async def on_admin(cb: CallbackQuery, bot: Bot) -> None:
         await db.mark_promo_announced(promo.id)
         total = len(await db.promo_recipients(promo))
         await cb.answer(f"🚀 Анонс летить: {total} отримувачів")
-        asyncio.create_task(_announce(bot, cb.message.chat.id, promo))
-        await show(cb.message, await admin_panel_text(), admin_kb(promo))
+        asyncio.create_task(_announce(bot, chat_id, promo))
+        text, kb = await admin_view()
+        await show(cb.message, text, kb)
+    elif action == "bc":
+        AWAIT[admin_id] = ("bc", time.time(), {"step": "uk", "texts": {}})
+        await cb.answer()
+        await show(cb.message, bc_prompt("uk"), bc_kb("uk"))
+    elif action == "bcskip":
+        pending = AWAIT.get(admin_id)
+        if not pending or pending[0] != "bc":
+            await cb.answer("Сесія оголошення завершилась — почни заново", show_alert=True)
+            return
+        await cb.answer()
+        await bc_advance(bot, chat_id, admin_id, pending[2])
+    elif action == "bcsend":
+        texts = BROADCAST.pop(admin_id, None)  # pop — щоб повторне натискання нічого не надіслало
+        if not texts:
+            await cb.answer("Нічого надсилати (або вже надіслано)", show_alert=True)
+            return
+        await cb.answer("🚀 Розсилка запущена")
+        await show(cb.message, "🚀 Оголошення розсилається… Звіт прийде сюди окремим повідомленням.")
+        asyncio.create_task(_broadcast(bot, chat_id, texts))
     elif action == "stats":
         await cb.answer()
         await show(cb.message, await stats_text(), admin_back_kb())
-    else:  # home
+    elif action == "links":
         await cb.answer()
-        await show(cb.message, await admin_panel_text(), admin_kb(await db.promo_window()))
-
-
-def admin_back_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⬅️ Панель адміна", callback_data="adm:home")
-    return kb.as_markup()
-
-
-@router.message(Command("broadcast"), ADMIN)
-async def cmd_broadcast(m: Message, command: CommandObject) -> None:
-    if not command.args:
-        await m.answer("Використання: /broadcast текст повідомлення (підтримується HTML)")
-        return
-    BROADCAST[m.from_user.id] = command.args
-    total = len(await db.all_user_ids())
-    await m.answer(
-        f"📣 <b>Попередній перегляд</b> (отримувачів: {total}):\n\n{command.args}\n\n"
-        "Підтвердити відправку: /broadcast_confirm"
-    )
-
-
-async def _broadcast(bot: Bot, admin_chat: int, text: str) -> None:
-    ok = fail = 0
-    for uid in await db.all_user_ids():
-        if await _send_safely(bot, uid, text):
-            ok += 1
-        else:
-            fail += 1
-        await asyncio.sleep(0.05)
-    await bot.send_message(admin_chat, f"📣 Розсилку завершено: доставлено {ok}, не вдалося {fail}.")
-
-
-@router.message(Command("broadcast_confirm"), ADMIN)
-async def cmd_broadcast_confirm(m: Message, bot: Bot) -> None:
-    text = BROADCAST.pop(m.from_user.id, None)
-    if not text:
-        await m.answer("Немає тексту для розсилки. Спочатку: /broadcast текст")
-        return
-    await m.answer("🚀 Розсилку запущено…")
-    asyncio.create_task(_broadcast(bot, m.chat.id, text))
+        await show(cb.message, links_text(), admin_back_kb())
+    else:  # home
+        AWAIT.pop(admin_id, None)
+        await cb.answer()
+        text, kb = await admin_view()
+        await show(cb.message, text, kb)
 
 
 # --------------------------------------------------------------------------- #
@@ -1049,7 +1261,7 @@ async def cmd_broadcast_confirm(m: Message, bot: Bot) -> None:
 async def do_search(m: Message, lang: str, query: str) -> None:
     uid = m.from_user.id
     if len(query) < 2:
-        await m.answer(tr(lang, "search_short"), reply_markup=main_menu(lang))
+        await m.answer(tr(lang, "search_short"), reply_markup=menu_for(m.chat.id, lang))
         return
     now = time.time()
     if now - LAST_SEARCH.get(uid, 0) < 2:
@@ -1061,10 +1273,10 @@ async def do_search(m: Message, lang: str, query: str) -> None:
     try:
         items = await downloader.search(query)
     except MediaError as exc:
-        await show(status, err_text(lang, exc), main_menu(lang))
+        await show(status, err_text(lang, exc), menu_for(m.chat.id, lang))
         return
     if not items:
-        await show(status, tr(lang, "search_none"), main_menu(lang))
+        await show(status, tr(lang, "search_none"), menu_for(m.chat.id, lang))
         return
     token = remember(uid, items)
     await show(status, tr(lang, "search_results", q=esc(query)), search_kb(token, items))
@@ -1106,7 +1318,7 @@ async def on_format(cb: CallbackQuery, bot: Bot) -> None:
 
     if code == "x":
         PENDING.pop(token, None)
-        await show(cb.message, tr(lang, "cancelled"), main_menu(lang))
+        await show(cb.message, tr(lang, "cancelled"), menu_for(cb.message.chat.id, lang))
         return
     if code in ("v1080", "cut") and not access.is_premium:
         promo = await db.promo_offer(access)
@@ -1135,6 +1347,14 @@ async def handle_awaited(
     kind, _, data = pending
     text = m.text.strip()
     uid = m.from_user.id
+    if kind in ("bc", "promo_custom"):  # кроки адміна (лише для адмінів; посилання в тексті дозволені)
+        if uid not in config.ADMIN_IDS:
+            return False
+        if kind == "bc":
+            await bc_receive(m, bot, data)
+        else:
+            await promo_custom_receive(m, text)
+        return True
     if URL_RE.search(text):  # людина передумала й надіслала нове посилання
         return False
 
@@ -1230,6 +1450,88 @@ async def on_text(m: Message, bot: Bot) -> None:
 
 
 # --------------------------------------------------------------------------- #
+#  Групи: бота можна додати до групи/супергрупи.
+#  Працює: /dl <посилання або назва> та (якщо вимкнено privacy mode) просто посилання в чаті.
+#  Профіль, тарифи, оплата, адмінка — ТІЛЬКИ в особистому чаті.
+# --------------------------------------------------------------------------- #
+def _group_user_ok(m: Message) -> bool:
+    return bool(m.from_user) and not m.from_user.is_bot
+
+
+async def process_group(m: Message, bot: Bot, text: str, explicit: bool) -> None:
+    """explicit=True — людина сама викликала /dl (відповідаємо на все); False — просто посилання в чаті
+    (щоб не спамити, невідомі посилання ігноруємо мовчки)."""
+    access, lang = await get_ctx(m.from_user)
+    match = URL_RE.search(text or "")
+    if not match:
+        if explicit:
+            query = (text or "").strip()
+            if query:
+                await do_search(m, lang, query)
+            else:
+                await m.answer(tr(lang, "group_usage"))
+        return
+    url = match.group(0)
+    platform = downloader.detect_platform(url)
+    if not platform:
+        if explicit:
+            await m.answer(tr(lang, "unsupported"))
+        return
+
+    if platform == "spotify":
+        try:
+            url = await downloader.spotify_expand(url)
+        except MediaError as exc:
+            if explicit:
+                await m.answer(err_text(lang, exc))
+            return
+        if re.search(r"/(album|playlist)/", url):
+            await m.answer(tr(lang, "group_spotify"))
+            return
+
+    if not access.allowed:
+        await send_paywall(bot, m.chat.id, lang, access)
+        return
+
+    uid = m.from_user.id
+    if platform == "youtube":
+        token = remember(uid, url)
+        await m.answer(tr(lang, "fmt_choose"), reply_markup=format_kb(lang, token, group=True))
+    elif platform in ("soundcloud", "spotify"):
+        await run_job(bot, m.chat.id, uid, lang, Job(url, platform, Options(fmt="mp3")))
+    else:  # tiktok, instagram, twitter, pinterest, facebook
+        await run_job(bot, m.chat.id, uid, lang, Job(url, platform, Options(fmt="mp4", height=720)))
+
+
+@group_router.message(Command("dl"))
+async def grp_dl(m: Message, command: CommandObject, bot: Bot) -> None:
+    if not _group_user_ok(m):
+        return
+    text = command.args or ""
+    if not text and m.reply_to_message and m.reply_to_message.text:  # /dl у відповідь на повідомлення з лінком
+        text = m.reply_to_message.text
+    await process_group(m, bot, text, explicit=True)
+
+
+@group_router.message(Command("start", "help"))
+async def grp_start(m: Message) -> None:
+    if not _group_user_ok(m):
+        return
+    _, lang = await get_ctx(m.from_user)
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(lang, "b_open_private"), url=f"https://t.me/{BOT_USERNAME}?start=menu")
+    await m.answer(tr(lang, "group_hint"), reply_markup=kb.as_markup())
+
+
+@group_router.message(F.text.regexp(r"https?://"))
+async def grp_link(m: Message, bot: Bot) -> None:
+    """Просто посилання в чаті (потрібен вимкнений privacy mode у BotFather)."""
+    if not _group_user_ok(m):
+        return
+    await process_group(m, bot, m.text, explicit=False)
+
+
+# --------------------------------------------------------------------------- #
 #  Запуск
 # --------------------------------------------------------------------------- #
 async def start_health_server() -> None:
@@ -1270,8 +1572,7 @@ async def main() -> None:
     )
     BOT_USERNAME = (await bot.get_me()).username or ""
 
-    await bot.set_my_commands(
-        [
+    private_commands = [
             BotCommand(command="menu", description="🏠 Головне меню"),
             BotCommand(command="profile", description="👤 Мій профіль і ліміти"),
             BotCommand(command="premium", description="💎 Преміум / Тарифи"),
@@ -1281,11 +1582,20 @@ async def main() -> None:
             BotCommand(command="help", description="🤝 Допомога"),
             BotCommand(command="privacy", description="🔒 Конфіденційність"),
             BotCommand(command="paysupport", description="💬 Питання щодо оплати"),
-        ]
+    ]
+    await bot.set_my_commands(private_commands)
+    await bot.set_my_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
+    await bot.set_my_commands(
+        [
+            BotCommand(command="dl", description="⬇️ Завантажити за посиланням або назвою"),
+            BotCommand(command="help", description="🤝 Допомога"),
+        ],
+        scope=BotCommandScopeAllGroupChats(),
     )
 
     dp = Dispatcher()
     dp.include_router(router)
+    dp.include_router(group_router)
     await start_health_server()
     await bot.delete_webhook(drop_pending_updates=True)
     log.info("Бот @%s запущено ✅", BOT_USERNAME)
