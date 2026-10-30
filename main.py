@@ -70,7 +70,6 @@ PLANS = {
     "week": {"stars": config.PRICE_WEEK, "days": 7},
     "month": {"stars": config.PRICE_MONTH, "days": 30},
     "quarter": {"stars": config.PRICE_QUARTER, "days": 90},
-    "promo": {"stars": config.PROMO_PRICE, "days": 1},  # лише для нових користувачів під час акції
 }
 REGULAR_PLANS = ("day", "week", "month", "quarter")
 DONATE_PRESETS = (25, 50, 100, 250)
@@ -126,6 +125,9 @@ def err_text(lang: str, exc: MediaError) -> str:
 
 async def get_ctx(user: User) -> tuple[db.Access, str]:
     access = await db.get_access(user.id)
+    code = (user.language_code or "")[:8]
+    if code and code != access.tg_lang:
+        await db.set_tg_lang(user.id, code)
     return access, pick_lang(access.lang, user.language_code)
 
 
@@ -173,27 +175,29 @@ def back_kb(lang: str, target: str = "menu:main") -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def _plan_buttons(kb: InlineKeyboardBuilder, lang: str, promo_until) -> None:
-    if promo_until:
-        kb.button(text=tr(lang, "b_promo", price=config.PROMO_PRICE), callback_data="buy:promo")
+def _plan_buttons(kb: InlineKeyboardBuilder, lang: str, promo: "db.Promo | None") -> None:
+    if promo:
+        kb.button(
+            text=tr(lang, "b_promo", days=promo.days, price=promo.price), callback_data="buy:promo"
+        )
     for pid in REGULAR_PLANS:
         kb.button(
             text=f"{tr(lang, 'plan_' + pid)} — {PLANS[pid]['stars']} ⭐", callback_data=f"buy:{pid}"
         )
 
 
-def premium_kb(lang: str, promo_until=None) -> InlineKeyboardMarkup:
+def premium_kb(lang: str, promo=None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    _plan_buttons(kb, lang, promo_until)
+    _plan_buttons(kb, lang, promo)
     kb.button(text=tr(lang, "b_donate"), callback_data="menu:donate")
     kb.button(text=tr(lang, "b_back"), callback_data="menu:main")
     kb.adjust(1)
     return kb.as_markup()
 
 
-def paywall_kb(lang: str, access: db.Access, promo_until=None) -> InlineKeyboardMarkup:
+def paywall_kb(lang: str, access: db.Access, promo=None) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    _plan_buttons(kb, lang, promo_until)
+    _plan_buttons(kb, lang, promo)
     if access.can_share:
         kb.button(text=tr(lang, "b_share", n=config.SHARE_BONUS), switch_inline_query="share")
     kb.button(text=tr(lang, "b_back"), callback_data="menu:main")
@@ -254,8 +258,9 @@ def search_kb(token: str, items: list) -> InlineKeyboardMarkup:
 # --------------------------------------------------------------------------- #
 #  Тексти екранів
 # --------------------------------------------------------------------------- #
-def promo_banner(lang: str, until) -> str:
-    return tr(lang, "promo_banner", price=config.PROMO_PRICE, until=db.fmt_dt(until))
+def promo_banner(lang: str, promo: "db.Promo") -> str:
+    offer = tr(lang, "promo_offer", days=promo.days, price=promo.price)
+    return tr(lang, "promo_banner", offer=offer, until=db.fmt_dt(promo.until))
 
 
 def profile_text(lang: str, access: db.Access, name: str) -> str:
@@ -268,20 +273,20 @@ def profile_text(lang: str, access: db.Access, name: str) -> str:
     )
 
 
-def premium_text(lang: str, promo_until=None) -> str:
+def premium_text(lang: str, promo=None) -> str:
     lines = "\n".join(
         f"{tr(lang, 'plan_' + pid)} — <b>{PLANS[pid]['stars']} ⭐</b>" for pid in REGULAR_PLANS
     )
     text = tr(lang, "premium_text", lines=lines)
-    return f"{promo_banner(lang, promo_until)}\n\n{text}" if promo_until else text
+    return f"{promo_banner(lang, promo)}\n\n{text}" if promo else text
 
 
-def paywall_text(lang: str, access: db.Access, promo_until=None) -> str:
+def paywall_text(lang: str, access: db.Access, promo=None) -> str:
     text = tr(lang, "paywall", reset=fmt_td(lang, db.time_to_reset().total_seconds()))
     if access.can_share:
         text += "\n\n" + tr(lang, "paywall_share", n=config.SHARE_BONUS)
-    if promo_until:
-        text = promo_banner(lang, promo_until) + "\n\n" + text
+    if promo:
+        text = promo_banner(lang, promo) + "\n\n" + text
     return text
 
 
@@ -633,13 +638,22 @@ async def send_invoice(
 @router.callback_query(F.data.startswith("buy:"))
 async def on_buy(cb: CallbackQuery) -> None:
     pid = cb.data.split(":", 1)[1]
-    plan = PLANS.get(pid)
     access, lang = await get_ctx(cb.from_user)
+    if pid == "promo":  # параметри акції беремо з бази, а не з коду
+        promo = await db.promo_offer(access)
+        if not promo:
+            await cb.answer(tr(lang, "promo_closed"), show_alert=True)
+            return
+        await cb.answer()
+        await send_invoice(
+            cb.message, tr(lang, "plan_promo", days=promo.days),
+            tr(lang, "plan_desc", days=promo.days),
+            f"promo:{promo.id}:{promo.days}", promo.price,
+        )
+        return
+    plan = PLANS.get(pid)
     if not plan:
         await cb.answer(tr(lang, "pre_fail"), show_alert=True)
-        return
-    if pid == "promo" and not await db.promo_offer(access):
-        await cb.answer(tr(lang, "promo_closed"), show_alert=True)
         return
     await cb.answer()
     await send_invoice(
@@ -674,9 +688,12 @@ async def on_pre_checkout(q: PreCheckoutQuery) -> None:
     if payload == "donate":
         ok = ok and config.DONATE_MIN <= q.total_amount <= config.DONATE_MAX
     elif payload.startswith("plan:") and payload[5:] in PLANS:
-        if payload == "plan:promo":
-            access = await db.get_access(q.from_user.id)
-            ok = ok and bool(await db.promo_offer(access))
+        pass
+    elif payload.startswith("promo:"):  # акція: має ще діяти і бути доступною саме цьому користувачу
+        parts = payload.split(":")
+        access = await db.get_access(q.from_user.id)
+        promo = await db.promo_offer(access)
+        ok = ok and bool(promo) and len(parts) == 3 and parts[1] == promo.id and parts[2] == str(promo.days)
     else:
         ok = False
     if ok:
@@ -696,6 +713,24 @@ async def on_paid(m: Message) -> None:
         is_new, _ = await db.add_payment(uid, "donate", 0, sp.total_amount, sp.telegram_payment_charge_id)
         if is_new:
             await m.answer(tr(lang, "donate_thanks"), reply_markup=main_menu(lang))
+        return
+
+    if sp.invoice_payload.startswith("promo:"):
+        try:
+            _, campaign, days_text = sp.invoice_payload.split(":")
+            days = int(days_text)
+        except ValueError:
+            log.error("Некоректний payload акції: %s", sp.invoice_payload)
+            await m.answer(tr(lang, "paid_unknown", contact=esc(config.SUPPORT_CONTACT)))
+            return
+        is_new, until = await db.add_payment(
+            uid, "promo", days, sp.total_amount, sp.telegram_payment_charge_id, campaign=campaign
+        )
+        if is_new:
+            await m.answer(
+                tr(lang, "paid_thanks", plan=tr(lang, "plan_promo", days=days), until=db.fmt_dt(until)),
+                reply_markup=main_menu(lang),
+            )
         return
 
     pid = sp.invoice_payload.split(":")[-1]
@@ -773,17 +808,72 @@ def parse_cut(text: str) -> tuple[float, float, str] | None:
 
 
 # --------------------------------------------------------------------------- #
-#  Адмінські команди (працюють лише для ID зі змінної ADMIN_IDS)
+#  Адмінка: акції в 1 клік, анонс, статистика, розсилка (лише для ID з ADMIN_IDS)
 # --------------------------------------------------------------------------- #
 ADMIN = F.from_user.id.in_(config.ADMIN_IDS)
 
+# ГОТОВІ АКЦІЇ ДЛЯ ЗАПУСКУ В 1 КЛІК — редагуй список під себе.
+# (код, на скільки днів безліміт, ціна в ⭐, кому: new/all/free, скільки годин триває акція)
+#   new  — лише нові користувачі (які зареєструвались після старту акції)
+#   all  — усі користувачі
+#   free — усі, у кого зараз немає активного преміуму
+PROMO_PRESETS = [
+    ("p1", 1, 1, "new", 72),
+    ("p2", 1, 1, "all", 24),
+    ("p3", 7, 35, "all", 48),
+    ("p4", 30, 99, "free", 72),
+]
+AUDIENCE_NAMES = {
+    "new": "нові користувачі",
+    "all": "усі користувачі",
+    "free": "усі без активного преміуму",
+}
+AUDIENCE_SHORT = {"new": "нові", "all": "усі", "free": "без преміуму"}
 
-@router.message(Command("stats"), ADMIN)
-async def cmd_stats(m: Message) -> None:
+
+def preset_label(days: int, price: int, audience: str, hours: int) -> str:
+    duration = f"{hours} год" if hours < 48 else f"{hours // 24} дн."
+    return f"🔥 {days} дн. за {price} ⭐ · {AUDIENCE_SHORT[audience]} · {duration}"
+
+
+def admin_kb(promo: "db.Promo | None") -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for code, days, price, audience, hours in PROMO_PRESETS:
+        kb.button(text=preset_label(days, price, audience, hours), callback_data=f"adm:promo:{code}")
+    if promo:
+        kb.button(text="📣 Анонсувати акцію тим, кому вона доступна", callback_data="adm:ann")
+        kb.button(text="⏹ Зупинити акцію", callback_data="adm:stop")
+    kb.button(text="📊 Статистика", callback_data="adm:stats")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+async def admin_panel_text() -> str:
+    promo = await db.promo_window()
+    if promo:
+        sold, stars = await db.promo_sales(promo)
+        announced = "надіслано" if await db.promo_is_announced(promo.id) else "ще не надсилався"
+        status = (
+            f"🔥 <b>Активна акція:</b> безліміт на {promo.days} дн. за {promo.price} ⭐\n"
+            f"👥 Для: {AUDIENCE_NAMES[promo.audience]}\n"
+            f"⏳ До: {db.fmt_dt(promo.until)}\n"
+            f"🛒 Куплено: {sold} ({stars} ⭐)\n"
+            f"📣 Анонс: {announced}"
+        )
+    else:
+        status = "Активної акції немає."
+    return (
+        "🛠 <b>Панель адміна</b>\n\n"
+        f"{status}\n\n"
+        "Обери готову акцію — вона стартує одразу. Нова акція замінює поточну.\n"
+        "Своя акція: <code>/promo 1 1 all 24</code>\n"
+        "(днів безліміту · ціна ⭐ · new/all/free · тривалість акції в годинах)"
+    )
+
+
+async def stats_text() -> str:
     s = await db.get_stats()
-    window = await db.promo_window()
-    promo = f"🔥 Акція триває до {db.fmt_dt(window[1])}" if window else "Акція вимкнена"
-    await m.answer(
+    return (
         "📊 <b>Статистика</b>\n\n"
         f"👥 Користувачів: <b>{s['users']}</b> (нових сьогодні: {s['new_today']}, активних сьогодні: {s['active_today']})\n"
         f"💎 Преміум зараз: <b>{s['premium_now']}</b>\n"
@@ -791,26 +881,73 @@ async def cmd_stats(m: Message) -> None:
         f"📥 Завантажень: сьогодні <b>{s['dl_today']}</b>, усього <b>{s['dl_total']}</b> "
         f"(миттєво з кешу: {s['dl_cached']}, файлів у кеші: {s['cache_items']})\n"
         f"⭐ Платежів: <b>{s['payments']}</b>, зірок усього: <b>{s['stars_total']}</b> "
-        f"(з них донати: {s['stars_donate']})\n\n{promo}"
+        f"(донати: {s['stars_donate']}, акційні покупки: {s['promo_sales']} на {s['promo_stars']} ⭐)"
     )
 
 
+async def _send_safely(bot: Bot, uid: int, text: str, kb: InlineKeyboardMarkup | None = None) -> bool:
+    """Надсилає повідомлення, переживає flood-ліміти; False — якщо не вдалося (напр. бот заблокований)."""
+    for _ in range(2):
+        try:
+            await bot.send_message(uid, text, reply_markup=kb)
+            return True
+        except TelegramRetryAfter as exc:
+            await asyncio.sleep(exc.retry_after)
+        except Exception:
+            return False
+    return False
+
+
+async def _announce(bot: Bot, admin_chat: int, promo: "db.Promo") -> None:
+    """Анонс акції: кожен отримує текст СВОЄЮ мовою та кнопку, що одразу відкриває оплату."""
+    ok = fail = 0
+    for uid, saved_lang, tg_lang in await db.promo_recipients(promo):
+        lang = pick_lang(saved_lang, tg_lang)
+        kb = InlineKeyboardBuilder()
+        kb.button(text=tr(lang, "b_promo", days=promo.days, price=promo.price), callback_data="buy:promo")
+        text = promo_banner(lang, promo) + "\n\n" + tr(lang, "promo_tail")
+        if await _send_safely(bot, uid, text, kb.as_markup()):
+            ok += 1
+        else:
+            fail += 1
+        await asyncio.sleep(0.05)  # ~20 повідомлень/сек — безпечно для лімітів Telegram
+    await bot.send_message(admin_chat, f"📣 Анонс акції завершено: доставлено {ok}, не вдалося {fail}.")
+
+
+@router.message(Command("admin"), ADMIN)
+async def cmd_admin(m: Message) -> None:
+    await m.answer(await admin_panel_text(), reply_markup=admin_kb(await db.promo_window()))
+
+
+@router.message(Command("stats"), ADMIN)
+async def cmd_stats(m: Message) -> None:
+    await m.answer(await stats_text())
+
+
 @router.message(Command("promo"), ADMIN)
-async def cmd_promo(m: Message) -> None:
-    window = await db.promo_window()
-    if window:
-        await m.answer(f"🔥 Акція триває до {db.fmt_dt(window[1])}. Вимкнути: /promo_off")
-    else:
-        await m.answer(f"Акція вимкнена. Увімкнути на {config.PROMO_DAYS} дн.: /promo_on (або /promo_on 3)")
-
-
-@router.message(Command("promo_on"), ADMIN)
-async def cmd_promo_on(m: Message, command: CommandObject) -> None:
-    days = int(command.args) if command.args and command.args.strip().isdigit() else config.PROMO_DAYS
-    until = await db.start_promo(max(1, min(days, 60)))
+async def cmd_promo(m: Message, command: CommandObject) -> None:
+    """/promo — панель; /promo ДНІ ЦІНА АУДИТОРІЯ ГОДИНИ — своя акція (напр. /promo 1 1 all 24)."""
+    if not command.args:
+        await m.answer(await admin_panel_text(), reply_markup=admin_kb(await db.promo_window()))
+        return
+    parts = command.args.split()
+    try:
+        days, price, audience, hours = int(parts[0]), int(parts[1]), parts[2].lower(), int(parts[3])
+    except (IndexError, ValueError):
+        days = price = hours = 0
+        audience = ""
+    if not (1 <= days <= 365 and 1 <= price <= 5000 and 1 <= hours <= 720 and audience in db.AUDIENCES):
+        await m.answer(
+            "Формат: <code>/promo ДНІ ЦІНА АУДИТОРІЯ ГОДИНИ</code>\n"
+            "Приклад: <code>/promo 1 1 all 24</code> — день безліміту за 1 ⭐ для всіх, акція триває 24 год.\n"
+            "Аудиторія: <b>new</b> (нові), <b>all</b> (усі), <b>free</b> (без активного преміуму).\n"
+            "Дні 1–365, ціна 1–5000 ⭐, тривалість 1–720 год."
+        )
+        return
+    promo = await db.start_promo(days, price, audience, hours)
     await m.answer(
-        f"🔥 Акцію запущено до {db.fmt_dt(until)}: день безліміту за {config.PROMO_PRICE} ⭐ "
-        "для нових користувачів. Не забудь анонсувати її (/broadcast)!"
+        "✅ Акцію запущено! Тепер її бачать у меню ті, кому вона доступна.\n\n" + await admin_panel_text(),
+        reply_markup=admin_kb(promo),
     )
 
 
@@ -818,6 +955,58 @@ async def cmd_promo_on(m: Message, command: CommandObject) -> None:
 async def cmd_promo_off(m: Message) -> None:
     await db.stop_promo()
     await m.answer("Акцію вимкнено.")
+
+
+@router.callback_query(F.data.startswith("adm:"))
+async def on_admin(cb: CallbackQuery, bot: Bot) -> None:
+    if cb.from_user.id not in config.ADMIN_IDS:
+        await cb.answer()
+        return
+    parts = cb.data.split(":")
+    action = parts[1]
+
+    if action == "promo" and len(parts) == 3:
+        preset = next((p for p in PROMO_PRESETS if p[0] == parts[2]), None)
+        if not preset:
+            await cb.answer("Невідомий пресет", show_alert=True)
+            return
+        _, days, price, audience, hours = preset
+        promo = await db.start_promo(days, price, audience, hours)
+        await cb.answer("🔥 Акцію запущено!")
+        await show(
+            cb.message,
+            "✅ Акцію запущено! Не забудь анонсувати її кнопкою нижче.\n\n" + await admin_panel_text(),
+            admin_kb(promo),
+        )
+    elif action == "stop":
+        await db.stop_promo()
+        await cb.answer("Акцію вимкнено")
+        await show(cb.message, await admin_panel_text(), admin_kb(None))
+    elif action == "ann":
+        promo = await db.promo_window()
+        if not promo:
+            await cb.answer("Немає активної акції", show_alert=True)
+            return
+        if await db.promo_is_announced(promo.id):
+            await cb.answer("Цю акцію вже анонсовано 👍", show_alert=True)
+            return
+        await db.mark_promo_announced(promo.id)
+        total = len(await db.promo_recipients(promo))
+        await cb.answer(f"🚀 Анонс летить: {total} отримувачів")
+        asyncio.create_task(_announce(bot, cb.message.chat.id, promo))
+        await show(cb.message, await admin_panel_text(), admin_kb(promo))
+    elif action == "stats":
+        await cb.answer()
+        await show(cb.message, await stats_text(), admin_back_kb())
+    else:  # home
+        await cb.answer()
+        await show(cb.message, await admin_panel_text(), admin_kb(await db.promo_window()))
+
+
+def admin_back_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ Панель адміна", callback_data="adm:home")
+    return kb.as_markup()
 
 
 @router.message(Command("broadcast"), ADMIN)
@@ -836,19 +1025,11 @@ async def cmd_broadcast(m: Message, command: CommandObject) -> None:
 async def _broadcast(bot: Bot, admin_chat: int, text: str) -> None:
     ok = fail = 0
     for uid in await db.all_user_ids():
-        try:
-            await bot.send_message(uid, text)
+        if await _send_safely(bot, uid, text):
             ok += 1
-        except TelegramRetryAfter as exc:
-            await asyncio.sleep(exc.retry_after)
-            try:
-                await bot.send_message(uid, text)
-                ok += 1
-            except Exception:
-                fail += 1
-        except Exception:  # користувач заблокував бота тощо
+        else:
             fail += 1
-        await asyncio.sleep(0.05)  # ~20 повідомлень/сек — безпечно для лімітів Telegram
+        await asyncio.sleep(0.05)
     await bot.send_message(admin_chat, f"📣 Розсилку завершено: доставлено {ok}, не вдалося {fail}.")
 
 

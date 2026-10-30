@@ -11,8 +11,6 @@
     SUPPORT_CONTACT    — твій @username для підтримки (показується у /paysupport)
     ADMIN_IDS          — твій Telegram ID (або кілька через кому) для /stats, /broadcast, /promo_on
     PRICE_DAY / PRICE_WEEK / PRICE_MONTH / PRICE_QUARTER — ціни у зірках (35 / 90 / 170 / 420)
-    PROMO_PRICE        — ціна акційного дня для нових користувачів (за замовчуванням 1 ⭐)
-    PROMO_DAYS         — тривалість акції у днях при /promo_on (за замовчуванням 7)
     LOCAL_API_URL      — адреса власного Bot API сервера (для файлів до 2 ГБ), напр. http://host:8081
     TZ_NAME            — часовий пояс для "півночі" (за замовчуванням Europe/Kyiv)
     DB_PATH            — шлях до файлу бази (за замовчуванням data/bot.db)
@@ -51,8 +49,6 @@ PRICE_DAY = _int("PRICE_DAY", 35)  # ⭐ за день безліміту
 PRICE_WEEK = _int("PRICE_WEEK", 90)  # ⭐ за 7 днів
 PRICE_MONTH = _int("PRICE_MONTH", 170)  # ⭐ за 30 днів безліміту
 PRICE_QUARTER = _int("PRICE_QUARTER", 420)  # ⭐ за 90 днів
-PROMO_PRICE = _int("PROMO_PRICE", 1)  # ⭐ акційний день для нових користувачів
-PROMO_DAYS = _int("PROMO_DAYS", 7)  # скільки днів триває акція після /promo_on
 DONATE_MIN = 1
 DONATE_MAX = 5000
 

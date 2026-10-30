@@ -1,6 +1,7 @@
 """Робота з базою даних (SQLite через aiosqlite)."""
 import datetime as dt
 import os
+import uuid
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
@@ -58,6 +59,8 @@ USER_COLUMNS = {
     "promo_used": "INTEGER NOT NULL DEFAULT 0",
     "last_share": "TEXT",
     "last_seen": "TEXT",
+    "promo_campaign": "TEXT",  # id останньої акції, якою скористався користувач
+    "tg_lang": "TEXT",  # мова Telegram користувача (для локалізованих анонсів)
 }
 
 
@@ -88,9 +91,10 @@ class Access:
     premium_until: dt.datetime | None
     lang: str | None
     created_at: dt.datetime
-    promo_used: bool
     ref_count: int
     last_share: str | None
+    promo_campaign: str | None
+    tg_lang: str | None
 
     @property
     def is_premium(self) -> bool:
@@ -168,11 +172,13 @@ async def get_access(user_id: int) -> Access:
         await _ensure_user(db, user_id)
         await db.commit()
         cur = await db.execute(
-            "SELECT free_used, bonus, premium_until, lang, created_at, promo_used, ref_count, last_share "
+            "SELECT free_used, bonus, premium_until, lang, created_at, ref_count, last_share, "
+            "promo_campaign, tg_lang "
             "FROM users WHERE user_id = ?",
             (user_id,),
         )
-        free_used, bonus, pu, lang, created, promo_used, ref_count, last_share = await cur.fetchone()
+        (free_used, bonus, pu, lang, created, ref_count, last_share,
+         promo_campaign, tg_lang) = await cur.fetchone()
     return Access(
         user_id=user_id,
         free_used=free_used,
@@ -180,9 +186,10 @@ async def get_access(user_id: int) -> Access:
         premium_until=dt.datetime.fromisoformat(pu) if pu else None,
         lang=lang,
         created_at=dt.datetime.fromisoformat(created),
-        promo_used=bool(promo_used),
         ref_count=ref_count,
         last_share=last_share,
+        promo_campaign=promo_campaign,
+        tg_lang=tg_lang,
     )
 
 
@@ -190,6 +197,12 @@ async def set_lang(user_id: int, lang: str) -> None:
     async with aiosqlite.connect(config.DB_PATH) as db:
         await _ensure_user(db, user_id)
         await db.execute("UPDATE users SET lang = ? WHERE user_id = ?", (lang, user_id))
+        await db.commit()
+
+
+async def set_tg_lang(user_id: int, code: str) -> None:
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute("UPDATE users SET tg_lang = ? WHERE user_id = ?", (code, user_id))
         await db.commit()
 
 
@@ -269,7 +282,7 @@ async def grant_share_bonus(user_id: int) -> bool:
 #  Платежі
 # --------------------------------------------------------------------------- #
 async def add_payment(
-    user_id: int, plan: str, days: int, stars: int, charge_id: str
+    user_id: int, plan: str, days: int, stars: int, charge_id: str, campaign: str | None = None
 ) -> tuple[bool, dt.datetime | None]:
     """
     Записує платіж. Якщо days > 0 — нараховує/продовжує преміум.
@@ -301,8 +314,10 @@ async def add_payment(
                 "UPDATE users SET premium_until = ? WHERE user_id = ?",
                 (new_until.isoformat(), user_id),
             )
-        if plan == "promo":
-            await db.execute("UPDATE users SET promo_used = 1 WHERE user_id = ?", (user_id,))
+        if plan == "promo" and campaign:
+            await db.execute(
+                "UPDATE users SET promo_campaign = ? WHERE user_id = ?", (campaign, user_id)
+            )
         await db.commit()
     return True, new_until
 
@@ -338,50 +353,134 @@ async def delete_cache(key: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-#  Акція для нових користувачів
+#  Акції (налаштовувані: тривалість підписки, ціна, аудиторія, строк дії)
 # --------------------------------------------------------------------------- #
+AUDIENCES = ("new", "all", "free")  # нові | усі | усі без активного преміуму
+
+
 async def _get_setting(db: aiosqlite.Connection, key: str) -> str | None:
     cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
     row = await cur.fetchone()
     return row[0] if row else None
 
 
-async def promo_window() -> tuple[dt.datetime, dt.datetime] | None:
-    """(початок, кінець) акції, якщо вона зараз триває."""
+@dataclass
+class Promo:
+    id: str
+    start: dt.datetime
+    until: dt.datetime
+    days: int  # на скільки днів безліміту
+    price: int  # ціна у зірках
+    audience: str  # new | all | free
+
+
+async def promo_window() -> Promo | None:
+    """Поточна акція, якщо вона триває."""
     async with aiosqlite.connect(config.DB_PATH) as db:
-        start = await _get_setting(db, "promo_start")
-        until = await _get_setting(db, "promo_until")
-    if not start or not until:
+        cur = await db.execute("SELECT key, value FROM settings WHERE key LIKE 'promo%'")
+        data = dict(await cur.fetchall())
+    try:
+        promo = Promo(
+            id=data["promo_id"],
+            start=dt.datetime.fromisoformat(data["promo_start"]),
+            until=dt.datetime.fromisoformat(data["promo_until"]),
+            days=int(data["promo_days"]),
+            price=int(data["promo_price"]),
+            audience=data.get("promo_aud", "new"),
+        )
+    except (KeyError, ValueError):
         return None
-    s, u = dt.datetime.fromisoformat(start), dt.datetime.fromisoformat(until)
-    return (s, u) if s <= _now_utc() < u else None
+    return promo if promo.start <= _now_utc() < promo.until else None
 
 
-async def promo_offer(access: Access) -> dt.datetime | None:
-    """
-    Дата завершення акції, якщо ЦЕЙ користувач має на неї право:
-    акція триває, користувач зареєструвався вже під час акції і ще не купував акційний день.
-    """
-    window = await promo_window()
-    if not window or access.promo_used or access.created_at < window[0]:
-        return None
-    return window[1]
+def _eligible(
+    promo: Promo, created_at: dt.datetime, premium_until: dt.datetime | None, campaign: str | None
+) -> bool:
+    if campaign == promo.id:  # цією акцією вже користувались
+        return False
+    if promo.audience == "new" and created_at < promo.start:
+        return False
+    if promo.audience == "free" and premium_until and premium_until > _now_utc():
+        return False
+    return True
 
 
-async def start_promo(days: int) -> dt.datetime:
+async def promo_offer(access: Access) -> Promo | None:
+    """Акція, доступна САМЕ цьому користувачеві (або None)."""
+    promo = await promo_window()
+    if promo and _eligible(promo, access.created_at, access.premium_until, access.promo_campaign):
+        return promo
+    return None
+
+
+async def start_promo(days: int, price: int, audience: str, hours: int) -> Promo:
     now = _now_utc()
-    until = now + dt.timedelta(days=days)
+    promo = Promo(
+        id=uuid.uuid4().hex[:8],
+        start=now,
+        until=now + dt.timedelta(hours=hours),
+        days=days,
+        price=price,
+        audience=audience,
+    )
+    values = {
+        "promo_id": promo.id,
+        "promo_start": promo.start.isoformat(),
+        "promo_until": promo.until.isoformat(),
+        "promo_days": str(days),
+        "promo_price": str(price),
+        "promo_aud": audience,
+    }
     async with aiosqlite.connect(config.DB_PATH) as db:
-        for key, value in (("promo_start", now.isoformat()), ("promo_until", until.isoformat())):
-            await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        await db.execute("DELETE FROM settings WHERE key LIKE 'promo%'")
+        for key, value in values.items():
+            await db.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, value))
         await db.commit()
-    return until
+    return promo
 
 
 async def stop_promo() -> None:
     async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.execute("DELETE FROM settings WHERE key IN ('promo_start', 'promo_until')")
+        await db.execute("DELETE FROM settings WHERE key LIKE 'promo%'")
         await db.commit()
+
+
+async def promo_is_announced(promo_id: str) -> bool:
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        return await _get_setting(db, "promo_announced") == promo_id
+
+
+async def mark_promo_announced(promo_id: str) -> None:
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('promo_announced', ?)", (promo_id,)
+        )
+        await db.commit()
+
+
+async def promo_recipients(promo: Promo) -> list[tuple[int, str | None, str | None]]:
+    """Кому надсилати анонс: (user_id, збережена мова, мова Telegram) — лише ті, хто має право на акцію."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT user_id, created_at, premium_until, promo_campaign, lang, tg_lang FROM users"
+        )
+        rows = await cur.fetchall()
+    out = []
+    for uid, created, pu, campaign, lang, tg in rows:
+        premium_until = dt.datetime.fromisoformat(pu) if pu else None
+        if _eligible(promo, dt.datetime.fromisoformat(created), premium_until, campaign):
+            out.append((uid, lang, tg))
+    return out
+
+
+async def promo_sales(promo: Promo) -> tuple[int, int]:
+    """(кількість покупок, зірок) за акційним тарифом відколи стартувала акція."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(stars), 0) FROM payments WHERE plan = 'promo' AND created_at >= ?",
+            (promo.start.isoformat(),),
+        )
+        return await cur.fetchone()
 
 
 # --------------------------------------------------------------------------- #
@@ -414,6 +513,8 @@ async def get_stats() -> dict:
             "stars_donate": await one(
                 "SELECT COALESCE(SUM(stars), 0) FROM payments WHERE plan = 'donate'"
             ),
+            "promo_sales": await one("SELECT COUNT(*) FROM payments WHERE plan = 'promo'"),
+            "promo_stars": await one("SELECT COALESCE(SUM(stars), 0) FROM payments WHERE plan = 'promo'"),
             "dl_today": await one("SELECT COUNT(*) FROM downloads WHERE day = ?", (today,)),
             "dl_total": await one("SELECT COUNT(*) FROM downloads"),
             "dl_cached": await one("SELECT COUNT(*) FROM downloads WHERE cached = 1"),

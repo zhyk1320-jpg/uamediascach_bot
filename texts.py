@@ -34,7 +34,9 @@ UK = {
     "b_share": "📤 Поділитись ботом → +{n} скачування",
     "b_donate": "💛 Підтримати проєкт",
     "b_other": "✍️ Інша сума",
-    "b_promo": "🔥 АКЦІЯ: день безліміту — {price} ⭐",
+    "b_promo": "🔥 АКЦІЯ: {days} дн. за {price} ⭐",
+    "promo_tail": "Забирай, поки діє 👇",
+    "promo_offer": "Безліміт на {days} дн. усього за <b>{price} ⭐</b>",
     # --- основні екрани ---
     "welcome": (
         "👋 Привіт, <b>{name}</b>!\n\n"
@@ -110,16 +112,13 @@ UK = {
         "Або зачекай {reset} — і ліміт оновиться сам 🕛"
     ),
     "paywall_share": "📤 А ще можна поділитись ботом із другом — і отримати <b>+{n}</b> скачування (раз на добу).",
-    "promo_banner": (
-        "🔥 <b>Акція для нових користувачів!</b>\n"
-        "День безліміту всього за <b>{price} ⭐</b> — діє до {until}."
-    ),
-    "promo_closed": "😕 Ця акція вже недоступна: вона діє лише для нових користувачів і один раз.",
+    "promo_banner": "🔥 <b>Спеціальна пропозиція!</b>\n{offer} — діє до {until}.",
+    "promo_closed": "😕 Ця акція вже недоступна або ти нею вже скористався.",
     "plan_day": "🌟 День безліміту",
     "plan_week": "⭐ Тиждень безліміту",
     "plan_month": "👑 Місяць безліміту",
     "plan_quarter": "🏆 3 місяці безліміту",
-    "plan_promo": "🔥 Акційний день безліміту",
+    "plan_promo": "🔥 Акція: безліміт на {days} дн.",
     "plan_desc": "Безлімітні завантаження на {days} дн.: 1080p, обрізка, GIF, плейлисти Spotify",
     "premium_only": (
         "💎 Ця функція доступна в <b>Преміумі</b>.\n"
@@ -265,7 +264,9 @@ RU = {
     "b_share": "📤 Поделиться ботом → +{n} скачивание",
     "b_donate": "💛 Поддержать проект",
     "b_other": "✍️ Другая сумма",
-    "b_promo": "🔥 АКЦИЯ: день безлимита — {price} ⭐",
+    "b_promo": "🔥 АКЦИЯ: {days} дн. за {price} ⭐",
+    "promo_tail": "Забирай, пока действует 👇",
+    "promo_offer": "Безлимит на {days} дн. всего за <b>{price} ⭐</b>",
     "welcome": (
         "👋 Привет, <b>{name}</b>!\n\n"
         "Я — твой карманный медиаконвертер 🎧🎬\n"
@@ -339,16 +340,13 @@ RU = {
         "Или подожди {reset} — и лимит обновится сам 🕛"
     ),
     "paywall_share": "📤 А ещё можно поделиться ботом с другом — и получить <b>+{n}</b> скачивание (раз в сутки).",
-    "promo_banner": (
-        "🔥 <b>Акция для новых пользователей!</b>\n"
-        "День безлимита всего за <b>{price} ⭐</b> — действует до {until}."
-    ),
-    "promo_closed": "😕 Эта акция уже недоступна: она действует только для новых пользователей и один раз.",
+    "promo_banner": "🔥 <b>Специальное предложение!</b>\n{offer} — действует до {until}.",
+    "promo_closed": "😕 Эта акция уже недоступна или ты ею уже воспользовался.",
     "plan_day": "🌟 День безлимита",
     "plan_week": "⭐ Неделя безлимита",
     "plan_month": "👑 Месяц безлимита",
     "plan_quarter": "🏆 3 месяца безлимита",
-    "plan_promo": "🔥 Акционный день безлимита",
+    "plan_promo": "🔥 Акция: безлимит на {days} дн.",
     "plan_desc": "Безлимитные загрузки на {days} дн.: 1080p, обрезка, GIF, плейлисты Spotify",
     "premium_only": (
         "💎 Эта функция доступна в <b>Премиуме</b>.\n"
@@ -485,7 +483,9 @@ EN = {
     "b_share": "📤 Share the bot → +{n} download",
     "b_donate": "💛 Support the project",
     "b_other": "✍️ Other amount",
-    "b_promo": "🔥 PROMO: 1-day unlimited — {price} ⭐",
+    "b_promo": "🔥 PROMO: {days} day(s) for {price} ⭐",
+    "promo_tail": "Grab it while it lasts 👇",
+    "promo_offer": "Unlimited for {days} day(s) for just <b>{price} ⭐</b>",
     "welcome": (
         "👋 Hi, <b>{name}</b>!\n\n"
         "I'm your pocket media converter 🎧🎬\n"
@@ -559,16 +559,13 @@ EN = {
         "Or wait {reset} — the limit will reset by itself 🕛"
     ),
     "paywall_share": "📤 You can also share the bot with a friend and get <b>+{n}</b> download (once a day).",
-    "promo_banner": (
-        "🔥 <b>New-user promo!</b>\n"
-        "1-day unlimited for just <b>{price} ⭐</b> — valid until {until}."
-    ),
-    "promo_closed": "😕 This promo is no longer available: it's for new users only and can be used once.",
+    "promo_banner": "🔥 <b>Special offer!</b>\n{offer} — valid until {until}.",
+    "promo_closed": "😕 This promo is no longer available or you have already used it.",
     "plan_day": "🌟 1 day unlimited",
     "plan_week": "⭐ 1 week unlimited",
     "plan_month": "👑 1 month unlimited",
     "plan_quarter": "🏆 3 months unlimited",
-    "plan_promo": "🔥 Promo: 1 day unlimited",
+    "plan_promo": "🔥 Promo: unlimited, {days} day(s)",
     "plan_desc": "Unlimited downloads for {days} day(s): 1080p, trimming, GIFs, Spotify playlists",
     "premium_only": (
         "💎 This feature is available in <b>Premium</b>.\n"
